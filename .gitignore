@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+# Nếu bạn không muốn đẩy bộ dữ liệu nặng lên:
+ml-100k/
