@@ -1,27 +1,17 @@
 import numpy as np
 import pandas as pd
-from collections import defaultdict
 import matplotlib.pyplot as plt
+import pickle
 
-class FastItemCF_Scratch:
-    def __init__(self, Y_data, k=200, shrink=20, min_common=2, pop_weight=0.6,
-                 n_users=None, n_items=None):
-
+class ItemBasedCF:
+    def __init__(self, Y_data, n_users, n_items, k=200, shrink=20, min_common=2, pop_weight=0.6):
         self.Y_data = Y_data.astype(np.float64)
+        self.n_users = n_users
+        self.n_items = n_items
         self.k = k
         self.shrink = shrink
         self.min_common = min_common
         self.pop_weight = pop_weight
-
-        if n_users is None:
-            self.n_users = int(np.max(self.Y_data[:, 0])) + 1
-        else:
-            self.n_users = n_users
-
-        if n_items is None:
-            self.n_items = int(np.max(self.Y_data[:, 1])) + 1
-        else:
-            self.n_items = n_items
 
     def normalize_Y(self):
         self.user_mean = np.zeros(self.n_users)
@@ -74,247 +64,301 @@ class FastItemCF_Scratch:
         self.normalize_Y()
         self.similarity()
 
-    def recommend(self, u, top_k=10, exclude_rated=True):
-        rated_idx = self.Y_data[:, 0] == u
-        rated_items = self.Y_data[rated_idx, 1].astype(np.int32)
+    def get_rated_items(self, u):
+        idx = self.Y_data[:, 0] == u
+        return self.Y_data[idx, 1].astype(int)
 
-        if exclude_rated:
-            mask = np.ones(self.n_items, dtype=bool)
-            mask[rated_items] = False
-            candidate_items = np.where(mask)[0]
-        else:
-            candidate_items = np.arange(self.n_items)
-
+    def predict(self, u, i):
+        """Hàm dự đoán điểm cụ thể để tính RMSE"""
+        if u >= self.n_users:
+            return None
+        
+        rated_items = self.get_rated_items(u)
         if len(rated_items) == 0:
-            preds = self.item_pop_norm[candidate_items]
-        else:
-            sim_matrix = self.S[candidate_items][:, rated_items]
-            rated_vals = (self.Ybar[u, rated_items] > 0).astype(float)
+            return self.user_mean[u] if u < self.n_users else 3.0
 
-            num = np.sum(sim_matrix * rated_vals, axis=1)
-            den = np.sum(np.abs(sim_matrix), axis=1) + 10.0
+        sim = self.S[i, rated_items]
+        r_vals = self.Ybar[u, rated_items]
 
-            preds = self.user_mean[u] + num / den + self.pop_weight * self.item_pop_norm[candidate_items]
+        den = np.sum(np.abs(sim))
+        if den == 0:
+            return self.user_mean[u]
 
-        if len(candidate_items) == 0:
-            return []
+        num = np.sum(sim * r_vals)
+        # Cộng thêm padding (ví dụ 5.0) dưới mẫu để regularization giống base code
+        pred = self.user_mean[u] + num / (den + 5.0) + self.pop_weight * self.item_pop_norm[i]
+        return np.clip(pred, 1, 5)
 
-        top_k_actual = min(top_k, len(candidate_items))
-        top_items_idx = np.argsort(preds)[-top_k_actual:][::-1]
+    def predict_score_for_ranking(self, u, i):
+        """Hàm dự đoán điểm tương đối để sort Ranking"""
+        if u >= self.n_users:
+            return None
+        
+        rated_items = self.get_rated_items(u)
+        if len(rated_items) == 0:
+            return self.item_pop_norm[i]
 
-        return candidate_items[top_items_idx].tolist()
+        sim = self.S[i, rated_items]
+        # Item-Item thường tính trọng số dựa trên việc user ĐÃ THÍCH phim cũ hay chưa (>0)
+        rated_vals = (self.Ybar[u, rated_items] > 0).astype(float)
+        
+        den = np.sum(np.abs(sim))
+        if den == 0:
+            return self.item_pop_norm[i]
 
-    def evaluate_ranking(self, data, top_k=10, threshold=4, exclude_rated=True):
-        test_dict = defaultdict(list)
-        for row in data:
-            u, i, r = int(row[0]), int(row[1]), row[2]
-            if r >= threshold:
-                test_dict[u].append(i)
+        num = np.sum(sim * rated_vals)
+        return self.user_mean[u] + num / (den + 10.0) + self.pop_weight * self.item_pop_norm[i]
 
-        precisions, recalls = [], []
+    def recommend(self, u, n_rec=5):
+        """API Recommender cho quá trình Deployment / Demo"""
+        if u >= self.n_users:
+            print(f"  [Cold-start] User {u} chưa có rating → fallback sang popularity-based")
+            return [(i, None) for i in top_popular(self.Y_data, n_rec)]
 
-        for u, relevant in test_dict.items():
-            recs = self.recommend(u, top_k, exclude_rated=exclude_rated)
-            hit = len(set(recs) & set(relevant))
+        items_u = self.get_rated_items(u)
+        all_items  = np.arange(self.n_items)
+        unrated    = np.setdiff1d(all_items, items_u)
 
-            precisions.append(hit / top_k)
-            recalls.append(hit / len(relevant))
+        preds = []
+        for i in unrated:
+            p = self.predict_score_for_ranking(u, i)
+            if p is not None:
+                preds.append((i, p))
 
-        if not precisions:
-            return 0.0, 0.0
+        if len(preds) == 0:
+            print(f"  [Cold-start] Không có dự đoán cho user {u} → fallback sang popularity-based")
+            return [(i, None) for i in top_popular(self.Y_data, n_rec)]
 
-        return np.mean(precisions), np.mean(recalls)
-
-    def evaluate_rmse(self, data):
-        se, cnt = 0, 0
-
-        for row in data:
-            u, i, r = int(row[0]), int(row[1]), row[2]
-
-            rated_idx = self.Y_data[:, 0] == u
-            rated_items = self.Y_data[rated_idx, 1].astype(np.int32)
-
-            if len(rated_items) == 0:
-                pred = self.user_mean[u]
-            else:
-                sim = self.S[i, rated_items]
-                r_vals = self.Ybar[u, rated_items]
-
-                num = np.sum(sim * r_vals)
-                den = np.sum(np.abs(sim)) + 5.0
-
-                pred = self.user_mean[u] + num / den + self.pop_weight * self.item_pop_norm[i]
-
-            se += (pred - r) ** 2
-            cnt += 1
-
-        return np.sqrt(se / cnt) if cnt > 0 else 0
-
+        preds.sort(key=lambda x: x[1], reverse=True)
+        return preds[:n_rec]
 
 def compute_f1(p, r):
     return 2 * p * r / (p + r + 1e-8)
 
+def top_popular(Y_data, top_n=5):
+    df = pd.DataFrame(Y_data, columns=["u", "i", "r"] + (["t"] if Y_data.shape[1] > 3 else []))
+    avg   = df.groupby("i")["r"].mean()
+    cnt   = df.groupby("i")["r"].count()
+    score = avg * np.log1p(cnt)
+    top_items = score.sort_values(ascending=False).index.tolist()
+    return top_items[:top_n]
 
-def custom_train_val_test_split(data_array, val_size=0.1, test_size=0.1, random_seed=42):
-    np.random.seed(random_seed)
-    user_records = defaultdict(list)
+def split_data(Y, train_ratio=0.7, valid_ratio=0.1):
+    user_items = {}
+    for row in Y:
+        u, i, r, t = row[0], row[1], row[2], row[3]
+        user_items.setdefault(int(u), []).append((i, r, t))
 
-    for row in data_array:
-        user_records[int(row[0])].append(row)
+    train, valid, test = [], [], []
+    for u in user_items:
+        items = sorted(user_items[u], key=lambda x: x[2]) 
+        n       = len(items)
+        n_train = int(train_ratio * n)
+        n_valid = int(valid_ratio * n)
+        for i, r, _ in items[:n_train]:
+            train.append([u, i, r])
+        for i, r, _ in items[n_train:n_train + n_valid]:
+            valid.append([u, i, r])
+        for i, r, _ in items[n_train + n_valid:]:
+            test.append([u, i, r])
 
-    train_list, val_list, test_list = [], [], []
+    return np.array(train), np.array(valid), np.array(test)
 
-    for u, records in user_records.items():
-        n = len(records)
-        np.random.shuffle(records)
+def rmse(model, data):
+    se, cnt = 0, 0
+    for u, i, r in data:
+        pred = model.predict(int(u), int(i))
+        if pred is None:
+            continue
+        se  += (r - pred) ** 2
+        cnt += 1
+    return np.sqrt(se / cnt) if cnt > 0 else float('nan')
 
-        if n < 5:
-            train_list.extend(records)
-        else:
-            n_test = int(n * test_size)
-            n_val = int(n * val_size)
-
-            test_list.extend(records[:n_test])
-            val_list.extend(records[n_test:n_test+n_val])
-            train_list.extend(records[n_test+n_val:])
-
-    return np.array(train_list), np.array(val_list), np.array(test_list)
-
-
-# ================= MAIN =================
-if __name__ == '__main__':
-    df = pd.read_csv('ml-100k/u.data', sep='\t',
-                     names=['user_id', 'item_id', 'rating', 'timestamp'])
-
-    df = df[df['item_id'].map(df['item_id'].value_counts()) >= 10]
-    df = df[df['user_id'].map(df['user_id'].value_counts()) >= 10]
-
-    user_map = {u: i for i, u in enumerate(df['user_id'].unique())}
-    item_map = {i: j for j, i in enumerate(df['item_id'].unique())}
-
-    df['user_id'] = df['user_id'].map(user_map)
-    df['item_id'] = df['item_id'].map(item_map)
-
-    data = df[['user_id', 'item_id', 'rating']].values
-
-    train, val, test = custom_train_val_test_split(data)
-
-    k_values = [10, 20]
-    shrink_values = [50, 100]
-
-    best_score = -1
-    best_params = None
-
-    print("\n=== GRID SEARCH LOG ===")
-
-    for k in k_values:
-        for shrink in shrink_values:
-            model = FastItemCF_Scratch(train, k=k, shrink=shrink)
-            model.fit()
-
-            # Bỏ đánh giá P/R trên Train, chỉ đánh giá trên Val
-            p_val, r_val = model.evaluate_ranking(val, exclude_rated=True)
-            rmse_train = model.evaluate_rmse(train)
-            rmse_val = model.evaluate_rmse(val)
-            f1_val = compute_f1(p_val, r_val)
-
-            print(f"\n[k={k}, shrink={shrink}]")    
-            print(f" Train -> RMSE={rmse_train:.4f}")
-            print(f" Val   -> P={p_val:.4f}, R={r_val:.4f}, F1={f1_val:.4f}, RMSE={rmse_val:.4f}")
-
-            if f1_val > best_score:
-                best_score = f1_val
-                best_params = {'k': k, 'shrink': shrink}
-
-    print("\n=== BEST PARAMS ===")
-    print(best_params, " | F1_val =", best_score)
-    
-    # ===== LEARNING CURVE =====
-    # Cập nhật lại các mốc train_sizes giống hệt ảnh mẫu
-    train_sizes = [0.1, 0.2, 0.3, 0.4, 0.5, 0.7, 1.0]
-
-    lc_p_val, lc_r_val = [], []
-    lc_rmse_tr, lc_rmse_val = [], []
-
-    n_users = int(np.max(data[:, 0])) + 1
-    n_items = int(np.max(data[:, 1])) + 1
-
-    print("\n=== LEARNING CURVE LOG ===")
-    
-    # Trộn đều dữ liệu để test Learning Curve
+def evaluate_top_k(model, data, n_items, K=10, threshold=4, n_neg=100):
     np.random.seed(42)
-    np.random.shuffle(train) 
+    user_liked = {}
+    for u, i, r in data:
+        if r >= threshold:
+            user_liked.setdefault(int(u), set()).add(int(i))
+
+    precisions, recalls = [], []
+
+    for u in user_liked:
+        liked   = user_liked[u]
+        items_u = set(model.get_rated_items(u))
+
+        valid_liked = liked - items_u
+        if not valid_liked:
+            continue
+
+        all_items = set(range(n_items))
+        negatives = list(all_items - items_u - valid_liked)
+        if len(negatives) < n_neg:
+            continue
+
+        negatives  = np.random.choice(negatives, n_neg, replace=False)
+        candidates = list(valid_liked) + list(negatives)
+        
+        np.random.shuffle(candidates)
+
+        preds = []
+        for i in candidates:
+            p = model.predict_score_for_ranking(u, i)
+            if p is not None:
+                p += np.random.uniform(0, 1e-6)
+                preds.append((i, p))
+
+        if not preds:
+            continue
+
+        preds.sort(key=lambda x: x[1], reverse=True)
+        top_k = set([i for i, _ in preds[:K]])
+        hits  = len(top_k & valid_liked)
+
+        precisions.append(hits / K)
+        recalls.append(hits / len(valid_liked))
+
+    return np.mean(precisions) if precisions else 0.0, np.mean(recalls) if recalls else 0.0
+
+
+# ========== MAIN ==========
+
+if __name__ == "__main__":
+    
+    df = pd.read_csv('ml-100k/u.data',
+                     sep='\t', names=['u', 'i', 'r', 't'])
+    df['u'] -= 1
+    df['i'] -= 1
+    Y = df.values  # 4 cột: u, i, r, t
+
+    n_users = int(np.max(Y[:, 0])) + 1
+    n_items = int(np.max(Y[:, 1])) + 1
+
+    # Chia theo timestamp
+    Y_train, Y_valid, Y_test = split_data(Y)
+
+    # ===== TUNING =====
+    best_f1 = -1
+    best_params    = {}
+    best_model     = None
+
+    for k in [10, 20, 30, 50]:
+        for shrink in [10, 20]:
+            for min_common in [3, 5]:
+                model = ItemBasedCF(Y_train, n_users, n_items,
+                                    k=k, shrink=shrink, min_common=min_common)
+                model.fit()
+
+                p_val, r_val = evaluate_top_k(model, Y_valid, n_items, K=10)
+                f1_val = compute_f1(p_val, r_val)
+                print(f"k={k}, shrink={shrink}, min_com={min_common} -> P@10={p_val:.4f}, R@10={r_val:.4f}, F1={f1_val:.4f}")
+                if f1_val > best_f1:
+                    best_f1 = f1_val
+                    best_params    = {'k': k, 'shrink': shrink, 'min_common': min_common}
+                    best_model     = model
+
+                print(f"k={k}, shrink={shrink}, min_common={min_common} "
+                      f"-> P@10={p_val:.4f}, R@10={r_val:.4f}")
+
+    print(f"\nBest params : {best_params} | Best F1: {best_f1:.4f}")
+
+    # ===== ĐÁNH GIÁ TRÊN TEST =====
+    test_rmse      = rmse(best_model, Y_test)
+    p_test, r_test = evaluate_top_k(best_model, Y_test, n_items, K=10)
+    print(f"\nTest RMSE : {test_rmse:.4f}")
+    print(f"Test P@10 : {p_test:.4f}")
+    print(f"Test R@10 : {r_test:.4f}")
+    print(f"Test F1: {compute_f1(p_test, r_test):.4f}")
+    # ===== LEARNING CURVE =====
+    print("\n=== VẼ LEARNING CURVE (Data Size) ===")
+
+    train_sizes = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+    train_rmses = []
+    valid_rmses = []
+    valid_p10s  = []
+
+    # Y_train đã mất cột t do hàm split_data, nhưng dữ liệu vẫn đang được giữ nguyên thứ tự thời gian
+    df_full = pd.DataFrame(Y_train, columns=["u", "i", "r"])  
 
     for frac in train_sizes:
-        n = int(len(train) * frac)
-        sub_train = train[:n]
+        print(f"Training with {frac*100:2.0f}% data...")
+        
+        # Lấy prefix theo thời gian cho từng user
+        Y_sub_list = []
+        for u, group in df_full.groupby('u'):
+            n_take = max(1, int(len(group) * frac))   # ít nhất 1 rating nếu có
+            Y_sub_list.append(group.iloc[:n_take].values)
+        
+        Y_sub = np.vstack(Y_sub_list)
+        
+        # Train model
+        lc_model = ItemBasedCF(Y_sub, n_users, n_items, **best_params)
+        lc_model.fit()
+        
+        # Đánh giá
+        tr_rmse = rmse(lc_model, Y_sub)
+        va_rmse = rmse(lc_model, Y_valid)
+        p_val, _ = evaluate_top_k(lc_model, Y_valid, n_items, K=10)
+        
+        train_rmses.append(tr_rmse)
+        valid_rmses.append(va_rmse)
+        valid_p10s.append(p_val if not np.isnan(p_val) else 0)
+        
+        print(f"  → Train RMSE: {tr_rmse:.4f} | Valid RMSE: {va_rmse:.4f} | P@10: {p_val:.4f}")
 
-        model = FastItemCF_Scratch(
-            sub_train,
-            k=best_params['k'],
-            shrink=best_params['shrink'],
-            n_users=n_users,
-            n_items=n_items
-        )
-        model.fit()
+    # ===== VẼ BIỂU ĐỒ =====
+    fig, ax1 = plt.subplots(figsize=(10, 6))
 
-        # Chỉ tính Ranking cho tập Validation
-        p_v, r_v = model.evaluate_ranking(val, exclude_rated=True)
-        rmse_tr = model.evaluate_rmse(sub_train)
-        rmse_v = model.evaluate_rmse(val)
+    ax1.set_xlabel('Training Data Size (%)')
+    ax1.set_ylabel('RMSE', color='tab:blue')
+    ax1.plot([int(x*100) for x in train_sizes], train_rmses, 'o-', color='tab:blue', label='Train RMSE')
+    ax1.plot([int(x*100) for x in train_sizes], valid_rmses, 'o--', color='tab:orange', label='Valid RMSE')
+    ax1.tick_params(axis='y', labelcolor='tab:blue')
+    ax1.legend(loc='upper left')
+    ax1.grid(alpha=0.3)
 
-        print(f"\n[Train size = {frac}]")
-        print(f" Train -> RMSE={rmse_tr:.4f}")
-        print(f" Val   -> P={p_v:.4f}, R={r_v:.4f}, RMSE={rmse_v:.4f}")
+    ax2 = ax1.twinx()
+    ax2.set_ylabel('Precision@10', color='tab:green')
+    ax2.plot([int(x*100) for x in train_sizes], valid_p10s, 's-', color='tab:green', label='Valid P@10')
+    ax2.tick_params(axis='y', labelcolor='tab:green')
+    ax2.legend(loc='upper right')
 
-        lc_p_val.append(p_v)
-        lc_r_val.append(r_v)
-        lc_rmse_tr.append(rmse_tr)
-        lc_rmse_val.append(rmse_v)
-
-    # ===== PLOT =====
-    # Khôi phục style mặc định (nền trắng) thay vì seaborn-darkgrid
-    plt.style.use('default') 
-    
-    # Label cho trục X hiển thị dạng %
-    x_labels = [f"{int(x*100)}%" for x in train_sizes]
-
-    # 1. Biểu đồ RMSE (Giống ảnh mẫu)
-    plt.figure(figsize=(8, 5), dpi=300) # Thêm dpi=300 để ảnh nét hơn
-    
-    plt.plot(train_sizes, lc_rmse_tr, marker='o', linestyle='-', color='#1f77b4', linewidth=1.5, label="Train RMSE")
-    plt.plot(train_sizes, lc_rmse_val, marker='o', linestyle='--', color='#ff7f0e', linewidth=1.5, label="Valid RMSE")
-    
-    plt.title("Learning Curve - Item-Based CF", fontsize=12)
-    plt.xlabel("Training data size", fontsize=10)
-    plt.ylabel("RMSE", fontsize=10)
-    
-    plt.xticks(train_sizes, x_labels)
-    # Cài đặt lưới mờ giống ảnh mẫu
-    plt.grid(True, color='#e6e6e6', linestyle='-', linewidth=1)
-    
-    plt.legend()
+    plt.title('Learning Curve - Item-Based Collaborative Filtering (MovieLens 100k)')
     plt.tight_layout()
-    # Lưu file PNG
-    plt.savefig('learning_curve_rmse.png', dpi=300, format='png', bbox_inches='tight')
+    plt.savefig('learning_curve_item_cf.png', dpi=200)
     plt.show()
 
-    # 2. Biểu đồ Đánh giá chất lượng Gợi ý (Validation Precision & Recall)
-    plt.figure(figsize=(8, 5), dpi=300)
-    
-    plt.plot(train_sizes, lc_p_val, marker='o', linestyle='-', color='green', linewidth=1.5, label="Val Precision")
-    plt.plot(train_sizes, lc_r_val, marker='o', linestyle='--', color='red', linewidth=1.5, label="Val Recall")
-    
-    plt.title("Learning Curve - Validation Ranking Metrics", fontsize=12)
-    plt.xlabel("Training data size", fontsize=10)
-    plt.ylabel("Score", fontsize=10)
-    
-    plt.xticks(train_sizes, x_labels)
-    # Cài đặt lưới mờ
-    plt.grid(True, color='#e6e6e6', linestyle='-', linewidth=1)
-    
-    plt.legend()
-    plt.tight_layout()
-    # Lưu file PNG
-    plt.savefig('learning_curve_ranking.png', dpi=300, format='png', bbox_inches='tight')
-    plt.show()
+    # ===== FINAL MODEL =====
+    final_model = ItemBasedCF(Y[:, :3], n_users, n_items, **best_params)
+    final_model.fit()
+
+    # ===== DEMO COLD-START =====
+    print("\n--- DEMO COLD-START ---")
+
+    # Case 1: user bình thường
+    print("\n[Case 1] User bình thường (user_id=0):")
+    recs = final_model.recommend(0, n_rec=5)
+    for item, score in recs:
+        print(f"  item={item}, score={score:.4f}" if score else f"  item={item}, score=popularity-based")
+
+    # Case 2: user mới
+    new_user_id = n_users
+    print(f"\n[Case 2] User mới (user_id={new_user_id}, chưa có rating):")
+    recs = final_model.recommend(new_user_id, n_rec=5)
+    for item, score in recs:
+        print(f"  item={item}, score=popularity-based")
+
+    # Case 3: phim mới
+    new_item_id  = n_items
+    n_items     += 1
+    print(f"\n[Case 3] Phim mới (item_id={new_item_id}, chưa có rating):")
+    print(f"  Phim {new_item_id} chưa có rating → predict trả None → không xuất hiện trong CF")
+    print(f"  Hệ thống fallback sang popularity-based:")
+    popular = top_popular(final_model.Y_data, top_n=5)
+    for item in popular:
+        print(f"  item={item}")
+
+    # ===== LƯU MODEL =====
+    with open("item_based_cf.pkl", "wb") as f:
+        pickle.dump(final_model, f)
+    print(f"\nĐã lưu model. Best params: {best_params}")
